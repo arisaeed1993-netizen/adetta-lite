@@ -177,7 +177,7 @@ with TABS[0]:
         st.subheader("Offene Posten je Kunde")
         q = """
         SELECT c.name AS kunde,
-               SUM(i.total - IFNULL(paid.sum_paid,0)) AS offen
+               SUM(i.total - COALESCE(paid.sum_paid, 0)::numeric) AS offen
         FROM invoices i
         JOIN deliveries d ON d.id = i.delivery_id
         JOIN customers c ON c.id = d.customer_id
@@ -344,4 +344,3 @@ with TABS[4]:
             st.cache_data.clear()
 
 st.caption("Adetta Lite v0.2 — Streamlit One‑File. Nächste Schritte: PDF‑Rechnungen, Multi‑Positionen, User‑Rollen, Cloud‑Deploy.")
-
