@@ -101,8 +101,15 @@ with ENGINE.begin() as conn:
 # ----------------- Helpers ------------------
 @st.cache_data(ttl=2)
 def load_df(query, **params):
-    with ENGINE.begin() as conn:
-        return pd.read_sql_query(text(query), conn, params=params)
+    try:
+        with ENGINE.begin() as conn:
+            return pd.read_sql_query(text(query), conn, params=params)
+    except Exception as e:
+        # Zeige die echte Fehlermeldung in der UI statt die App abstürzen zu lassen
+        st.error("SQL-Fehler in Abfrage:")
+        st.code(query, language="sql")
+        st.exception(e)
+        return pd.DataFrame()
 
 def execute(sql, **params):
     with ENGINE.begin() as conn:
@@ -337,3 +344,4 @@ with TABS[4]:
             st.cache_data.clear()
 
 st.caption("Adetta Lite v0.2 — Streamlit One‑File. Nächste Schritte: PDF‑Rechnungen, Multi‑Positionen, User‑Rollen, Cloud‑Deploy.")
+
