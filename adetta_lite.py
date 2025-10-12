@@ -17,11 +17,19 @@
 # - Dashboard (Low-Stock, offene Posten je Kunde, Umsätze letzte 30 Tage)
 import streamlit as st
 
+# ---- App-Einstellungen ----
 st.set_page_config(
     page_title="Adetta",
-    page_icon="adetta_icon.png",  # Datei im selben Ordner
+    page_icon="https://raw.githubusercontent.com/arisaeed1993-netizen/adetta-lite/main/assets/adetta_icon_512.png",
     layout="wide"
 )
+
+# ---- iPhone/iPad Homescreen Icon ----
+st.markdown("""
+<link rel="apple-touch-icon" sizes="180x180" href="https://raw.githubusercontent.com/<DEIN_GITHUB_NAME>/adetta-lite/main/assets/adetta_icon_180.png?v=1">
+<link rel="icon" type="image/png" sizes="512x512" href="https://raw.githubusercontent.com/<DEIN_GITHUB_NAME>/adetta-lite/main/assets/adetta_icon_512.png?v=1">
+""", unsafe_allow_html=True)
+
 
 import os
 from datetime import datetime, date, timedelta
