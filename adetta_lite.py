@@ -15,6 +15,13 @@
 # - Lieferungen buchen (Bestand automatisch reduzieren, Rechnung anlegen)
 # - Rechnungen & Zahlungen (offen/teilweise/bezahlt)
 # - Dashboard (Low-Stock, offene Posten je Kunde, Umsätze letzte 30 Tage)
+import streamlit as st
+
+st.set_page_config(
+    page_title="Adetta",
+    page_icon="adetta_icon.png",  # Datei im selben Ordner
+    layout="wide"
+)
 
 import os
 from datetime import datetime, date, timedelta
