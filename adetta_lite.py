@@ -28,64 +28,72 @@ DB_URL = os.environ.get("ADETTA_DB", "sqlite:///adetta_lite.db")
 ENGINE = create_engine(DB_URL, future=True)
 
 # ------------------ DB INIT ------------------
-DDL = [
-    """
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        sku TEXT UNIQUE NOT NULL,
-        price NUMERIC DEFAULT 0,
-        stock INTEGER DEFAULT 0,
-        min_stock INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS customers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        address TEXT,
-        contact TEXT,
-        terms INTEGER DEFAULT 30,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS deliveries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ddate TEXT NOT NULL,
-        customer_id INTEGER NOT NULL,
-        product_id INTEGER NOT NULL,
-        qty INTEGER NOT NULL,
-        unit_price NUMERIC NOT NULL,
-        note TEXT,
-        FOREIGN KEY(customer_id) REFERENCES customers(id),
-        FOREIGN KEY(product_id) REFERENCES products(id)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS invoices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        delivery_id INTEGER NOT NULL,
-        total NUMERIC NOT NULL,
-        issued_at TEXT NOT NULL,
-        due_at TEXT NOT NULL,
-        status TEXT DEFAULT 'open', -- open/partial/paid
-        FOREIGN KEY(delivery_id) REFERENCES deliveries(id)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        invoice_id INTEGER NOT NULL,
-        amount NUMERIC NOT NULL,
-        paid_at TEXT NOT NULL,
-        method TEXT DEFAULT 'cash',
-        note TEXT,
-        FOREIGN KEY(invoice_id) REFERENCES invoices(id)
-    )
-    """,
-]
+# ---- DDL: SQLite vs. Postgres kompatibel -----------------
+DIALECT = ENGINE.url.get_backend_name()
+
+def make_ddl(dialect: str):
+    # SQLite nutzt AUTOINCREMENT, Postgres nutzt SERIAL
+    id_col = "SERIAL PRIMARY KEY" if dialect.startswith("postgresql") else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    return [
+        f"""
+        CREATE TABLE IF NOT EXISTS products (
+            id {id_col},
+            name TEXT NOT NULL,
+            sku TEXT UNIQUE NOT NULL,
+            price NUMERIC DEFAULT 0,
+            stock INTEGER DEFAULT 0,
+            min_stock INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS customers (
+            id {id_col},
+            name TEXT NOT NULL,
+            address TEXT,
+            contact TEXT,
+            terms INTEGER DEFAULT 30,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS deliveries (
+            id {id_col},
+            ddate DATE NOT NULL,
+            customer_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            qty INTEGER NOT NULL,
+            unit_price NUMERIC NOT NULL,
+            note TEXT,
+            CONSTRAINT fk_cust FOREIGN KEY(customer_id) REFERENCES customers(id),
+            CONSTRAINT fk_prod FOREIGN KEY(product_id) REFERENCES products(id)
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS invoices (
+            id {id_col},
+            delivery_id INTEGER NOT NULL,
+            total NUMERIC NOT NULL,
+            issued_at DATE NOT NULL,
+            due_at DATE NOT NULL,
+            status TEXT DEFAULT 'open',
+            CONSTRAINT fk_deliv FOREIGN KEY(delivery_id) REFERENCES deliveries(id)
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS payments (
+            id {id_col},
+            invoice_id INTEGER NOT NULL,
+            amount NUMERIC NOT NULL,
+            paid_at DATE NOT NULL,
+            method TEXT DEFAULT 'cash',
+            note TEXT,
+            CONSTRAINT fk_inv FOREIGN KEY(invoice_id) REFERENCES invoices(id)
+        )
+        """,
+    ]
+
+DDL = make_ddl(DIALECT)
 with ENGINE.begin() as conn:
     for ddl in DDL:
         conn.execute(text(ddl))
