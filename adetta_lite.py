@@ -19,10 +19,10 @@
 import os
 from datetime import datetime, date, timedelta
 from decimal import Decimal
-
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
+
 
 DB_URL = os.environ.get("ADETTA_DB", "sqlite:///adetta_lite.db")
 ENGINE = create_engine(DB_URL, future=True)
@@ -150,7 +150,7 @@ def refresh_invoice_statuses():
         execute("UPDATE invoices SET status=:s WHERE id=:i", s=s, i=i)
 
 # ----------------- UI -----------------------
-st.set_page_config(page_title="Adetta Lite", page_icon="🧴", layout="wide")
+st.set_page_config(page_title="Adetta", page_icon="🧴", layout="wide")
 
 # Optional: einfacher PIN-Schutz
 PIN = os.environ.get("ADETTA_PIN", "")
