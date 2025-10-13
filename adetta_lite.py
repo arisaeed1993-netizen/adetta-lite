@@ -15,21 +15,6 @@
 # - Lieferungen buchen (Bestand automatisch reduzieren, Rechnung anlegen)
 # - Rechnungen & Zahlungen (offen/teilweise/bezahlt)
 # - Dashboard (Low-Stock, offene Posten je Kunde, Umsätze letzte 30 Tage)
-import streamlit as st
-
-# ---- App-Einstellungen ----
-st.set_page_config(
-    page_title="Adetta",
-    page_icon="https://raw.githubusercontent.com/arisaeed1993-netizen/adetta-lite/main/assets/adetta_icon_512.png",
-    layout="wide"
-)
-
-# ---- iPhone/iPad Homescreen Icon ----
-st.markdown("""
-<link rel="apple-touch-icon" sizes="180x180" href="https://raw.githubusercontent.com/<DEIN_GITHUB_NAME>/adetta-lite/main/assets/adetta_icon_180.png?v=1">
-<link rel="icon" type="image/png" sizes="512x512" href="https://raw.githubusercontent.com/<DEIN_GITHUB_NAME>/adetta-lite/main/assets/adetta_icon_512.png?v=1">
-""", unsafe_allow_html=True)
-
 
 import os
 from datetime import datetime, date, timedelta
@@ -339,23 +324,52 @@ with TABS[4]:
     st.dataframe(dfi, use_container_width=True)
 
     st.subheader("Zahlung buchen")
-    if dfi.empty:
-        st.info("Keine Rechnungen vorhanden.")
-    else:
-        with st.form("pay_form", clear_on_submit=True):
-            inv_id = st.selectbox("Rechnung #", dfi["rechnung"].astype(int).tolist())
-            amount = st.number_input("Betrag", min_value=0.0, step=0.01)
-            paid_at = st.date_input("Datum", value=date.today())
-            method = st.selectbox("Methode", ["cash","bank","card"])
-            note = st.text_input("Notiz", value="")
-            ok = st.form_submit_button("Buchen")
-        if ok:
+if dfi.empty:
+    st.info("Keine Rechnungen vorhanden.")
+else:
+    # Auswahl der Rechnung + Anzeige Zahlungsverlauf
+    left, right = st.columns([1, 1])
+    with left:
+        inv_choices = dfi["rechnung"].astype(int).tolist()
+        inv_id = st.selectbox("Rechnung #", inv_choices)
+        # Offener Betrag dieser Rechnung
+        open_amt = float(dfi[dfi["rechnung"].astype(int) == int(inv_id)]["offen"].iloc[0])
+        paid_amt = float(dfi[dfi["rechnung"].astype(int) == int(inv_id)]["bezahlt"].iloc[0]) if "bezahlt" in dfi.columns else 0.0
+        st.metric("Offen", f"{open_amt:,.2f}")
+        st.metric("Bereits bezahlt", f"{paid_amt:,.2f}")
+    with right:
+        st.markdown("**Zahlungsverlauf**")
+        hist = load_df(
+            "SELECT id, paid_at AS datum, amount AS betrag, method AS methode, COALESCE(note,'') AS notiz "
+            "FROM payments WHERE invoice_id=:i ORDER BY paid_at ASC, id ASC",
+            i=int(inv_id)
+        )
+        if hist.empty:
+            st.caption("Noch keine Zahlungen erfasst.")
+        else:
+            st.dataframe(hist, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    with st.form("pay_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        amount = c1.number_input("Betrag", min_value=0.01, step=0.01, value=min(max(open_amt, 0.01), 100000.0))
+        paid_at = c2.date_input("Datum", value=date.today())
+        c3, c4 = st.columns(2)
+        method = c3.selectbox("Methode", ["cash", "bank", "card"]) 
+        note = c4.text_input("Notiz", value="")
+        ok = st.form_submit_button("Zahlung buchen")
+
+    if ok:
+        if amount > open_amt + 1e-6:
+            st.error(f"Der Betrag ({amount:,.2f}) ist höher als der offene Betrag ({open_amt:,.2f}).")
+        else:
             execute(
                 "INSERT INTO payments(invoice_id,amount,paid_at,method,note) VALUES (:i,:a,:p,:m,:n)",
                 i=int(inv_id), a=float(amount), p=paid_at.isoformat(), m=method, n=note
             )
             refresh_invoice_statuses()
-            st.success("Zahlung verbucht")
+            rest = max(open_amt - float(amount), 0.0)
+            st.success(f"Zahlung verbucht. Rest offen: {rest:,.2f}")
             st.cache_data.clear()
 
 st.caption("Adetta Lite v0.2 — Streamlit One‑File. Nächste Schritte: PDF‑Rechnungen, Multi‑Positionen, User‑Rollen, Cloud‑Deploy.")
