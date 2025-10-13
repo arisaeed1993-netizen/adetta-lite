@@ -91,6 +91,18 @@ def make_ddl(dialect: str):
             CONSTRAINT fk_inv FOREIGN KEY(invoice_id) REFERENCES invoices(id)
         )
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id {id_col},
+            edate DATE NOT NULL,
+            category TEXT NOT NULL,     -- Lohn, Lagerung, Transport, Werbung, Standkosten
+            amount NUMERIC NOT NULL,
+            customer_id INTEGER,        -- optional: für Standkosten je Supermarkt
+            note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_exp_cust FOREIGN KEY(customer_id) REFERENCES customers(id)
+        )
+        """,
     ]
 
 DDL = make_ddl(DIALECT)
@@ -157,46 +169,59 @@ if PIN:
 
 st.title("Adetta Lite 🧴")
 
-TABS = st.tabs(["📊 Dashboard", "📦 Produkte", "🧑‍🤝‍🧑 Kunden", "🚚 Lieferungen", "🧾 Rechnungen & Zahlungen"])  
+TABS = st.tabs(["📊 Dashboard", "📦 Produkte", "🧑‍🤝‍🧑 Kunden", "🚚 Lieferungen", "🧾 Rechnungen & Zahlungen", "💸 Ausgaben"])  
 
 # ------------- Dashboard -------------
 with TABS[0]:
-    col1, col2 = st.columns([2, 1])
-    # Lager
-    with col1:
-        st.subheader("Lagerbestand")
-        dfp = load_df("SELECT id,name,sku,price,stock,min_stock FROM products ORDER BY name")
-        st.dataframe(dfp, use_container_width=True)
-        low = dfp[dfp["stock"] <= dfp["min_stock"]]
-        if not low.empty:
-            st.warning("Niedriger Bestand bei: " + ", ".join(low["name"].tolist()))
-        else:
-            st.success("Keine Low-Stock-Warnungen.")
-    # Offene Posten
-    with col2:
-        st.subheader("Offene Posten je Kunde")
+    st.subheader("Lagerbestand")
+    dfp = load_df("SELECT id,name,sku,price,stock,min_stock FROM products ORDER BY name")
+    st.dataframe(dfp, use_container_width=True)
+    low = dfp[dfp["stock"] <= dfp["min_stock"]]
+    if not low.empty:
+        st.warning("Niedriger Bestand bei: " + ", ".join(low["name"].tolist()))
+    else:
+        st.success("Keine Low-Stock-Warnungen.")
+
+    st.divider()
+    st.subheader("Umsatz")
+    # Zeitraum wählen: 30 / 90 / 365 Tage oder Alle
+    period = st.selectbox("Zeitraum", ["30 Tage", "90 Tage", "365 Tage", "Alle"], index=0)
+    if period == "Alle":
+        since = None
+    else:
+        days = int(period.split()[0])
+        since = (date.today() - timedelta(days=days)).isoformat()
+
+    # Gesamtumsatz
+    if since:
+        rev_total = load_df("SELECT COALESCE(SUM(total),0) AS s FROM invoices WHERE issued_at >= :d", d=since).iloc[0]["s"] or 0
+    else:
+        rev_total = load_df("SELECT COALESCE(SUM(total),0) AS s FROM invoices",).iloc[0]["s"] or 0
+    st.metric("Gesamtumsatz", f"{rev_total:,.2f}")
+
+    # Umsatz je Supermarkt (Kunde)
+    if since:
         q = """
-        SELECT c.name AS kunde,
-               SUM(i.total - COALESCE(paid.sum_paid, 0)::numeric) AS offen
+        SELECT c.name AS supermarkt, SUM(i.total) AS umsatz
         FROM invoices i
         JOIN deliveries d ON d.id = i.delivery_id
         JOIN customers c ON c.id = d.customer_id
-        LEFT JOIN (
-            SELECT invoice_id, SUM(amount) AS sum_paid FROM payments GROUP BY invoice_id
-        ) paid ON paid.invoice_id = i.id
-        WHERE i.status != 'paid'
+        WHERE i.issued_at >= :d
         GROUP BY c.name
-        ORDER BY offen DESC
+        ORDER BY umsatz DESC
         """
-        dfb = load_df(q)
-        st.dataframe(dfb, use_container_width=True)
-
-    st.divider()
-    st.subheader("Umsatz (letzte 30 Tage)")
-    q30 = "SELECT SUM(total) AS revenue_30 FROM invoices WHERE issued_at >= :d"
-    since = (date.today() - timedelta(days=30)).isoformat()
-    rev = load_df(q30, d=since).iloc[0]["revenue_30"] or 0
-    st.metric("Umsatz 30 Tage", f"{rev:,.2f}")
+        df_rev = load_df(q, d=since)
+    else:
+        q = """
+        SELECT c.name AS supermarkt, SUM(i.total) AS umsatz
+        FROM invoices i
+        JOIN deliveries d ON d.id = i.delivery_id
+        JOIN customers c ON c.id = d.customer_id
+        GROUP BY c.name
+        ORDER BY umsatz DESC
+        """
+        df_rev = load_df(q)
+    st.dataframe(df_rev, use_container_width=True)
 
 # ------------- Produkte -------------
 with TABS[1]:
@@ -371,5 +396,55 @@ else:
             rest = max(open_amt - float(amount), 0.0)
             st.success(f"Zahlung verbucht. Rest offen: {rest:,.2f}")
             st.cache_data.clear()
+            st.rerun()
 
-st.caption("Adetta Lite v0.2 — Streamlit One‑File. Nächste Schritte: PDF‑Rechnungen, Multi‑Positionen, User‑Rollen, Cloud‑Deploy.")
+# ------------- Ausgaben -------------
+with TABS[5]:
+    st.subheader("Ausgaben erfassen")
+    cat_options = ["Lohn", "Lagerung", "Transport", "Werbung", "Standkosten"]
+    dfc = load_df("SELECT id,name FROM customers ORDER BY name")
+    with st.form("exp_add", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        edate = c1.date_input("Datum", value=date.today())
+        category = c2.selectbox("Kategorie", cat_options)
+        amount = st.number_input("Betrag", min_value=0.01, step=0.01)
+        note = st.text_input("Notiz", value="")
+        cust_id = None
+        if category == "Standkosten":
+            if dfc.empty:
+                st.info("Für Standkosten bitte zuerst Kunden anlegen.")
+            else:
+                cust_name = st.selectbox("Supermarkt (für Standkosten)", dfc["name"].tolist())
+                cust_id = int(dfc[dfc["name"] == cust_name].iloc[0]["id"]) if cust_name else None
+        ok = st.form_submit_button("Ausgabe speichern")
+    if ok:
+        execute(
+            "INSERT INTO expenses(edate,category,amount,customer_id,note) VALUES (:d,:c,:a,:cid,:n)",
+            d=edate.isoformat(), c=category, a=float(amount), cid=cust_id, n=note
+        )
+        st.success("Ausgabe gespeichert")
+        st.cache_data.clear()
+        st.rerun()
+
+    st.subheader("Ausgaben-Übersicht")
+    period = st.selectbox("Zeitraum", ["30 Tage", "90 Tage", "365 Tage", "Alle"], index=0)
+    if period == "Alle":
+        since = None
+    else:
+        days = int(period.split()[0])
+        since = (date.today() - timedelta(days=days)).isoformat()
+    if since:
+        dfe = load_df("SELECT e.id, e.edate, e.category, e.amount, COALESCE(c.name,'') AS kunde, e.note FROM expenses e LEFT JOIN customers c ON c.id = e.customer_id WHERE e.edate >= :d ORDER BY e.edate DESC", d=since)
+    else:
+        dfe = load_df("SELECT e.id, e.edate, e.category, e.amount, COALESCE(c.name,'') AS kunde, e.note FROM expenses e LEFT JOIN customers c ON c.id = e.customer_id ORDER BY e.edate DESC")
+    st.dataframe(dfe, use_container_width=True)
+
+    # Summen je Kategorie
+    if since:
+        dsum = load_df("SELECT category, SUM(amount) AS summe FROM expenses WHERE edate >= :d GROUP BY category ORDER BY summe DESC", d=since)
+    else:
+        dsum = load_df("SELECT category, SUM(amount) AS summe FROM expenses GROUP BY category ORDER BY summe DESC")
+    st.subheader("Summen je Kategorie")
+    st.dataframe(dsum, use_container_width=True)
+
+st.caption("Adetta Lite v0.3 — Umsatz je Supermarkt, Ausgaben-Seite, Auto-Refresh nach Buchungen.")
