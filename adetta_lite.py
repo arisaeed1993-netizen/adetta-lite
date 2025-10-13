@@ -185,7 +185,7 @@ with TABS[0]:
     st.divider()
     st.subheader("Umsatz")
     # Zeitraum wählen: 30 / 90 / 365 Tage oder Alle
-    period = st.selectbox("Zeitraum", ["30 Tage", "90 Tage", "365 Tage", "Alle"], index=0)
+    period = st.selectbox("Zeitraum", ["30 Tage", "90 Tage", "365 Tage", "Alle"], index=0, key="period_dashboard")
     if period == "Alle":
         since = None
     else:
@@ -277,8 +277,8 @@ with TABS[3]:
     else:
         with st.form("deliv_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
-            cust = c1.selectbox("Kunde", dfc["name"].tolist())
-            prod = c2.selectbox("Produkt", [f"{r.name} (Lager: {r.stock})" for r in dfp.itertuples()])
+            cust = c1.selectbox("Kunde", dfc["name"].tolist(), key="deliv_customer")
+            prod = c2.selectbox("Produkt", [f"{r.name} (Lager: {r.stock})" for r in dfp.itertup
             qty = st.number_input("Kartons", min_value=1, step=1)
             unit_price = st.number_input("Preis/Karton", min_value=0.0, step=0.01)
             ddate = st.date_input("Datum", value=date.today())
@@ -380,7 +380,7 @@ else:
         amount = c1.number_input("Betrag", min_value=0.01, step=0.01, value=min(max(open_amt, 0.01), 100000.0))
         paid_at = c2.date_input("Datum", value=date.today())
         c3, c4 = st.columns(2)
-        method = c3.selectbox("Methode", ["cash", "bank", "card"]) 
+        method = c3.selectbox("Methode", ["cash", "bank", "card"], key="pay_method") 
         note = c4.text_input("Notiz", value="")
         ok = st.form_submit_button("Zahlung buchen")
 
@@ -406,7 +406,7 @@ with TABS[5]:
     with st.form("exp_add", clear_on_submit=True):
         c1, c2 = st.columns(2)
         edate = c1.date_input("Datum", value=date.today())
-        category = c2.selectbox("Kategorie", cat_options)
+        category = c2.selectbox("Kategorie", cat_options, key="exp_category")
         amount = st.number_input("Betrag", min_value=0.01, step=0.01)
         note = st.text_input("Notiz", value="")
         cust_id = None
@@ -414,7 +414,7 @@ with TABS[5]:
             if dfc.empty:
                 st.info("Für Standkosten bitte zuerst Kunden anlegen.")
             else:
-                cust_name = st.selectbox("Supermarkt (für Standkosten)", dfc["name"].tolist())
+                cust_name = st.selectbox("Supermarkt (für Standkosten)", dfc["name"].tolist(), key="stand_customer")
                 cust_id = int(dfc[dfc["name"] == cust_name].iloc[0]["id"]) if cust_name else None
         ok = st.form_submit_button("Ausgabe speichern")
     if ok:
@@ -427,7 +427,7 @@ with TABS[5]:
         st.rerun()
 
     st.subheader("Ausgaben-Übersicht")
-    period = st.selectbox("Zeitraum", ["30 Tage", "90 Tage", "365 Tage", "Alle"], index=0)
+    period = st.selectbox("Zeitraum", ["30 Tage", "90 Tage", "365 Tage", "Alle"], index=0, key="period_expenses")
     if period == "Alle":
         since = None
     else:
