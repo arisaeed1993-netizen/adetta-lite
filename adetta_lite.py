@@ -255,10 +255,87 @@ with TABS[2]:
             st.rerun()
 
     st.subheader("Kunden")
-    st.dataframe(
-        load_df("SELECT id,name,address,contact,terms,created_at FROM customers ORDER BY name"),
-        use_container_width=True
+    dfc_view = load_df(
+        "SELECT id,name,address,contact,terms,created_at "
+        "FROM customers ORDER BY name"
     )
+    st.dataframe(dfc_view, use_container_width=True)
+
+    # -------- Kundendetails: Schulden & gelieferte Ware --------
+    if not dfc_view.empty:
+        st.markdown("### Kundendetails")
+
+        selected_name = st.selectbox(
+            "Supermarkt auswählen",
+            dfc_view["name"].tolist(),
+            key="customer_detail"
+        )
+
+        sel = dfc_view[dfc_view["name"] == selected_name].iloc[0]
+        cid = int(sel["id"])
+
+        # 1) Offener Betrag (Schulden)
+        q_open = """
+        SELECT
+            COALESCE(SUM(i.total), 0)            AS gesamt_rechnung,
+            COALESCE(SUM(pay.sum_paid), 0)       AS gesamt_bezahlt,
+            COALESCE(SUM(i.total), 0) - COALESCE(SUM(pay.sum_paid), 0) AS offen
+        FROM invoices i
+        JOIN deliveries d ON d.id = i.delivery_id
+        LEFT JOIN (
+            SELECT invoice_id, SUM(amount) AS sum_paid
+            FROM payments
+            GROUP BY invoice_id
+        ) pay ON pay.invoice_id = i.id
+        WHERE d.customer_id = :cid
+        """
+        df_amt = load_df(q_open, cid=cid)
+        if not df_amt.empty:
+            gesamt = float(df_amt["gesamt_rechnung"].iloc[0] or 0)
+            bezahlt = float(df_amt["gesamt_bezahlt"].iloc[0] or 0)
+            offen = float(df_amt["offen"].iloc[0] or 0)
+        else:
+            gesamt = bezahlt = offen = 0.0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Gesamt in Rechnung gestellt", f"{gesamt:,.2f}")
+        c2.metric("Bisher bezahlt", f"{bezahlt:,.2f}")
+        c3.metric("Offen (Schulden)", f"{offen:,.2f}")
+
+        st.markdown("---")
+
+        # 2) Gelieferte Ware (Menge & ggf. Wert)
+        q_deliv_sum = """
+        SELECT
+            COALESCE(SUM(d.qty), 0)         AS gesamt_kartons,
+            COALESCE(SUM(d.qty * d.unit_price), 0) AS gesamt_warenwert
+        FROM deliveries d
+        WHERE d.customer_id = :cid
+        """
+        df_deliv_sum = load_df(q_deliv_sum, cid=cid)
+        ges_kartons = int(df_deliv_sum["gesamt_kartons"].iloc[0] or 0)
+        ges_wert = float(df_deliv_sum["gesamt_warenwert"].iloc[0] or 0)
+
+        c4, c5 = st.columns(2)
+        c4.metric("Gelieferte Kartons (gesamt)", f"{ges_kartons}")
+        c5.metric("Warenwert (gesamt)", f"{ges_wert:,.2f}")
+
+        # Optional: Aufschlüsselung nach Produkt
+        st.markdown("#### Gelieferte Produkte (Detail)")
+        q_deliv_detail = """
+        SELECT
+            p.name AS produkt,
+            SUM(d.qty) AS kartons,
+            SUM(d.qty * d.unit_price) AS warenwert
+        FROM deliveries d
+        JOIN products p ON p.id = d.product_id
+        WHERE d.customer_id = :cid
+        GROUP BY p.name
+        ORDER BY kartons DESC
+        """
+        df_deliv_detail = load_df(q_deliv_detail, cid=cid)
+        st.dataframe(df_deliv_detail, use_container_width=True)
+
 
 # ------------- Lieferungen -------------
 with TABS[3]:
