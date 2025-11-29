@@ -155,7 +155,27 @@ if PIN:
                 st.error("Falscher PIN")
         st.stop()
 
-st.title("Adetta Lite 🧴")
+st.title("Adetta Lite ")
+
+def reset_all_data():
+    """Alle Tabellen leeren und IDs zurücksetzen – funktioniert für SQLite und Postgres."""
+    if DIALECT.startswith("postgresql"):
+        # Postgres / Neon
+        execute("""
+            TRUNCATE TABLE payments, invoices, deliveries, expenses, customers, products
+            RESTART IDENTITY CASCADE;
+        """)
+    else:
+        # SQLite
+        for tbl in ["payments", "invoices", "deliveries", "expenses", "customers", "products"]:
+            execute(f"DELETE FROM {tbl}")
+        try:
+            # IDs zurücksetzen (sqlite_sequence existiert nur, wenn AUTOINCREMENT genutzt wird)
+            execute("DELETE FROM sqlite_sequence WHERE name IN "
+                    "('payments','invoices','deliveries','expenses','customers','products')")
+        except Exception:
+            pass
+
 
 TABS = st.tabs([
     "📊 Dashboard",
@@ -444,3 +464,22 @@ with TABS[5]:
     st.dataframe(dsum, use_container_width=True)
 
 st.caption("Adetta Lite v0.3 — Umsatz je Supermarkt, Ausgaben-Seite, Auto-Refresh nach Buchungen.")
+
+# ------------------ Admin: Daten zurücksetzen ------------------
+with st.expander("🛠️ Admin: Daten zurücksetzen (Gefahr!)", expanded=False):
+    st.warning(
+        "⚠️ Das löscht **alle Daten**: Produkte, Kunden, Lieferungen, Rechnungen, Zahlungen und Ausgaben.\n\n"
+        "Diese Aktion kann **nicht rückgängig gemacht** werden!"
+    )
+
+    colA, colB, colC = st.columns(3)
+    backup_hint = colA.checkbox("✅ Ich habe ein Backup erstellt.")
+    confirm = colB.checkbox("✅ Ich verstehe die Konsequenzen.")
+    really = colC.button("❌ Alles löschen", type="primary", disabled=not (backup_hint and confirm))
+
+    if really:
+        reset_all_data()
+        st.cache_data.clear()
+        st.success("✅ Alle Daten wurden gelöscht und IDs zurückgesetzt.")
+        st.balloons()
+        st.rerun()
