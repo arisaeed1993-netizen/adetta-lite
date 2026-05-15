@@ -71,6 +71,7 @@ def make_ddl(dialect: str):
         f"""
         CREATE TABLE IF NOT EXISTS invoices (
             id {id_col},
+            invoice_no INTEGER,
             delivery_id INTEGER NOT NULL,
             total NUMERIC NOT NULL,
             issued_at DATE NOT NULL,
@@ -116,12 +117,16 @@ with ENGINE.begin() as conn:
         if DIALECT.startswith("postgresql"):
             conn.execute(text("ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS invoice_id INTEGER"))
             conn.execute(text("ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS header_id INTEGER"))
+            conn.execute(text("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS invoice_no INTEGER"))
         else:
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(deliveries)")).fetchall()]
             if "invoice_id" not in cols:
                 conn.execute(text("ALTER TABLE deliveries ADD COLUMN invoice_id INTEGER"))
             if "header_id" not in cols:
                 conn.execute(text("ALTER TABLE deliveries ADD COLUMN header_id INTEGER"))
+            inv_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(invoices)")).fetchall()]
+            if "invoice_no" not in inv_cols:
+                conn.execute(text("ALTER TABLE invoices ADD COLUMN invoice_no INTEGER"))
     except Exception:
         pass
 
@@ -159,6 +164,19 @@ with ENGINE.begin() as conn:
             "h": created_headers[group_key],
             "id": row["id"],
         })
+
+    # Sichtbare Rechnungsnummer: standardmäßig dieselbe Nummer wie die sichtbare Liefer-ID.
+    # Die technische invoices.id bleibt intern unabhängig und kann daher höher/niedriger sein.
+    conn.execute(text("""
+        UPDATE invoices
+        SET invoice_no = (
+            SELECT d.header_id
+            FROM deliveries d
+            WHERE d.id = invoices.delivery_id
+            LIMIT 1
+        )
+        WHERE invoice_no IS NULL
+    """))
 
 
 # ------------------ Helper ------------------
@@ -554,9 +572,10 @@ def render_deliveries():
                         # Für Kompatibilität bleibt invoices.delivery_id auf der ersten Produktposition.
                         first_delivery_line_id = delivery_line_ids[0]
                         conn.execute(text(
-                            "INSERT INTO invoices(delivery_id,total,issued_at,due_at,status) "
-                            "VALUES (:delivery_id, :t, :i, :du, 'open')"
+                            "INSERT INTO invoices(invoice_no,delivery_id,total,issued_at,due_at,status) "
+                            "VALUES (:invoice_no, :delivery_id, :t, :i, :du, 'open')"
                         ), {
+                            "invoice_no": int(header_id),
                             "delivery_id": first_delivery_line_id,
                             "t": float(invoice_total),
                             "i": ddate.isoformat(),
@@ -591,7 +610,8 @@ def render_deliveries():
                {product_summary} AS produkte,
                SUM(d.qty) AS kartons,
                SUM(d.qty * d.unit_price) AS total,
-               MIN(i.id) AS invoice_id,
+               MIN(i.id) AS interne_invoice_id,
+               MIN(COALESCE(i.invoice_no, i.id)) AS rechnungsnr,
                MIN(i.status) AS status
         FROM delivery_headers h
         JOIN customers c ON c.id = h.customer_id
@@ -704,7 +724,10 @@ def render_invoices_payments():
         else "GROUP_CONCAT(p.name || ' x ' || d.qty, ', ')"
     )
     dfi = load_df(f"""
-        SELECT i.id AS rechnung, i.issued_at, i.due_at, i.total, i.status,
+        SELECT i.id AS invoice_id,
+               COALESCE(i.invoice_no, MIN(d.header_id), i.id) AS rechnung,
+               MIN(d.header_id) AS lieferung_id,
+               i.issued_at, i.due_at, i.total, i.status,
                c.name AS kunde,
                {product_summary} AS produkte,
                SUM(d.qty) AS kartons,
@@ -717,8 +740,8 @@ def render_invoices_payments():
         LEFT JOIN (
             SELECT invoice_id, SUM(amount) AS sum_paid FROM payments GROUP BY invoice_id
         ) pay ON pay.invoice_id = i.id
-        GROUP BY i.id, i.issued_at, i.due_at, i.total, i.status, c.name, pay.sum_paid
-        ORDER BY i.id DESC
+        GROUP BY i.id, i.invoice_no, i.issued_at, i.due_at, i.total, i.status, c.name, pay.sum_paid
+        ORDER BY rechnung DESC
     """)
     st.dataframe(dfi, use_container_width=True)
 
@@ -728,10 +751,18 @@ def render_invoices_payments():
     else:
         left, right = st.columns([1, 1])
         with left:
-            inv_choices = dfi["rechnung"].astype(int).tolist()
-            inv_id = st.selectbox("Rechnung #", inv_choices, key="inv_select")
-            open_amt = float(dfi[dfi["rechnung"].astype(int) == int(inv_id)]["offen"].iloc[0])
-            paid_amt = float(dfi[dfi["rechnung"].astype(int) == int(inv_id)]["bezahlt"].iloc[0])
+            inv_choices = dfi["invoice_id"].astype(int).tolist()
+            inv_id = st.selectbox(
+                "Rechnung #",
+                inv_choices,
+                format_func=lambda iid: (
+                    f"Rechnung #{int(dfi[dfi['invoice_id'].astype(int) == int(iid)]['rechnung'].iloc[0])} "
+                    f"(Lieferung #{int(dfi[dfi['invoice_id'].astype(int) == int(iid)]['lieferung_id'].iloc[0])})"
+                ),
+                key="inv_select"
+            )
+            open_amt = float(dfi[dfi["invoice_id"].astype(int) == int(inv_id)]["offen"].iloc[0])
+            paid_amt = float(dfi[dfi["invoice_id"].astype(int) == int(inv_id)]["bezahlt"].iloc[0])
             st.metric("Offen", money(open_amt))
             st.metric("Bereits bezahlt", money(paid_amt))
         with right:
@@ -772,8 +803,10 @@ def render_invoices_payments():
     st.divider()
     st.subheader("Zahlung korrigieren oder löschen")
     df_payments_edit = load_df("""
-        SELECT p.id, p.invoice_id, p.amount, p.paid_at, p.method, COALESCE(p.note,'') AS note
+        SELECT p.id, p.invoice_id, COALESCE(i.invoice_no, i.id) AS rechnung_nr,
+               p.amount, p.paid_at, p.method, COALESCE(p.note,'') AS note
         FROM payments p
+        JOIN invoices i ON i.id = p.invoice_id
         ORDER BY p.paid_at DESC, p.id DESC
     """)
 
@@ -786,7 +819,7 @@ def render_invoices_payments():
             pay_choices,
             format_func=lambda pid: (
                 f"#{pid} - Rechnung "
-                f"{int(df_payments_edit[df_payments_edit['id'].astype(int) == int(pid)]['invoice_id'].iloc[0])} - "
+                f"{int(df_payments_edit[df_payments_edit['id'].astype(int) == int(pid)]['rechnung_nr'].iloc[0])} - "
                 f"{df_payments_edit[df_payments_edit['id'].astype(int) == int(pid)]['amount'].iloc[0]} - "
                 f"{df_payments_edit[df_payments_edit['id'].astype(int) == int(pid)]['paid_at'].iloc[0]}"
             ),
@@ -932,7 +965,7 @@ def main():
     elif page == "💸 Ausgaben":
         render_expenses()
 
-    st.caption("Adetta Lite v0.8 — Eine sichtbare Liefer-ID pro Lieferung, mehrere Produktpositionen darunter, eine Rechnung pro Lieferung.")
+    st.caption("Adetta Lite v0.9 — Liefer-ID und sichtbare Rechnungsnummer sind jetzt identisch; technische IDs bleiben intern getrennt.")
 
 
 if __name__ == "__main__":
