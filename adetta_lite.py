@@ -561,6 +561,83 @@ else:
                 st.cache_data.clear()
                 st.rerun()
 
+st.subheader("Lieferung korrigieren")
+
+df_edit_del = load_df("""
+SELECT d.id, d.qty, d.unit_price, d.product_id, d.customer_id,
+       p.name AS produkt, c.name AS kunde
+FROM deliveries d
+JOIN products p ON p.id = d.product_id
+JOIN customers c ON c.id = d.customer_id
+ORDER BY d.id DESC
+""")
+
+if not df_edit_del.empty:
+    del_label = df_edit_del.apply(
+        lambda r: f"#{r['id']} - {r['kunde']} - {r['produkt']} - {r['qty']} Kartons",
+        axis=1
+    ).tolist()
+
+    selected_del = st.selectbox(
+        "Lieferung auswählen",
+        del_label,
+        key="edit_delivery_select"
+    )
+
+    selected_id = int(selected_del.split(" - ")[0].replace("#", ""))
+    drow = df_edit_del[df_edit_del["id"] == selected_id].iloc[0]
+
+    with st.form("edit_delivery_form"):
+        new_qty = st.number_input(
+            "Neue Anzahl Kartons",
+            min_value=1,
+            step=1,
+            value=int(drow["qty"])
+        )
+
+        save_del = st.form_submit_button("Lieferung korrigieren")
+
+    if save_del:
+        old_qty = int(drow["qty"])
+        diff = int(new_qty) - old_qty
+        product_id = int(drow["product_id"])
+
+        current_stock = load_df(
+            "SELECT stock FROM products WHERE id=:id",
+            id=product_id
+        ).iloc[0]["stock"]
+
+        if diff > int(current_stock):
+            st.error("Nicht genug Lagerbestand für diese Korrektur.")
+        else:
+            execute(
+                "UPDATE deliveries SET qty=:q WHERE id=:id",
+                q=int(new_qty),
+                id=selected_id
+            )
+
+            execute(
+                "UPDATE products SET stock = stock - :diff WHERE id=:pid",
+                diff=diff,
+                pid=product_id
+            )
+
+            new_total = Decimal(str(new_qty)) * Decimal(str(drow["unit_price"]))
+            execute(
+                """
+                UPDATE invoices
+                SET total=:t
+                WHERE delivery_id=:did
+                """,
+                t=float(new_total),
+                did=selected_id
+            )
+
+            refresh_invoice_statuses()
+            st.success("Lieferung wurde korrigiert.")
+            st.cache_data.clear()
+            st.rerun()
+
 
 # --------- Rechnungen & Zahlungen ---------
 with TABS[4]:
