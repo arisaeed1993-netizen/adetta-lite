@@ -708,6 +708,78 @@ with TABS[4]:
                 st.cache_data.clear()
                 st.rerun()
 
+st.subheader("Zahlung korrigieren oder löschen")
+
+df_payments_edit = load_df("""
+SELECT p.id, p.invoice_id, p.amount, p.paid_at, p.method, COALESCE(p.note,'') AS note
+FROM payments p
+ORDER BY p.paid_at DESC, p.id DESC
+""")
+
+if df_payments_edit.empty:
+    st.caption("Keine Zahlungen vorhanden.")
+else:
+    pay_label = df_payments_edit.apply(
+        lambda r: f"#{r['id']} - Rechnung {r['invoice_id']} - {r['amount']} - {r['paid_at']}",
+        axis=1
+    ).tolist()
+
+    selected_payment = st.selectbox(
+        "Zahlung auswählen",
+        pay_label,
+        key="edit_payment_select"
+    )
+
+    pay_id = int(selected_payment.split(" - ")[0].replace("#", ""))
+    prow = df_payments_edit[df_payments_edit["id"] == pay_id].iloc[0]
+
+    with st.form("edit_payment_form"):
+        new_amount = st.number_input(
+            "Betrag",
+            min_value=0.01,
+            step=0.01,
+            value=float(prow["amount"])
+        )
+        new_paid_at = st.date_input(
+            "Datum",
+            value=pd.to_datetime(prow["paid_at"]).date()
+        )
+        new_method = st.selectbox(
+            "Methode",
+            ["cash", "bank", "card"],
+            index=["cash", "bank", "card"].index(prow["method"]) if prow["method"] in ["cash", "bank", "card"] else 0,
+            key="edit_payment_method"
+        )
+        new_note = st.text_input("Notiz", value=prow["note"])
+
+        save_payment = st.form_submit_button("Zahlung speichern")
+
+    c1, c2 = st.columns(2)
+
+    if save_payment:
+        execute(
+            """
+            UPDATE payments
+            SET amount=:a, paid_at=:p, method=:m, note=:n
+            WHERE id=:id
+            """,
+            a=float(new_amount),
+            p=new_paid_at.isoformat(),
+            m=new_method,
+            n=new_note,
+            id=pay_id
+        )
+        refresh_invoice_statuses()
+        st.success("Zahlung wurde aktualisiert.")
+        st.cache_data.clear()
+        st.rerun()
+
+    if c2.button("Zahlung löschen", key="delete_payment_btn"):
+        execute("DELETE FROM payments WHERE id=:id", id=pay_id)
+        refresh_invoice_statuses()
+        st.success("Zahlung wurde gelöscht.")
+        st.cache_data.clear()
+        st.rerun()
 # ------------- Ausgaben -------------
 with TABS[5]:
     st.subheader("Ausgaben erfassen")
