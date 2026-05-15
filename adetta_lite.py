@@ -261,6 +261,48 @@ with TABS[2]:
     )
     st.dataframe(dfc_view, use_container_width=True)
 
+    st.subheader("Kunde bearbeiten")
+
+if not dfc_view.empty:
+    edit_customer = st.selectbox(
+        "Kunde auswählen",
+        dfc_view["name"].tolist(),
+        key="edit_customer_select"
+    )
+
+    row = dfc_view[dfc_view["name"] == edit_customer].iloc[0]
+    customer_id = int(row["id"])
+
+    with st.form("edit_customer_form"):
+        new_name = st.text_input("Name", value=row["name"])
+        new_address = st.text_input("Adresse", value=row["address"] or "")
+        new_contact = st.text_input("Kontakt", value=row["contact"] or "")
+        new_terms = st.number_input(
+            "Zahlungsziel Tage",
+            min_value=0,
+            step=1,
+            value=int(row["terms"])
+        )
+
+        save_customer = st.form_submit_button("Kunden speichern")
+
+    if save_customer:
+        execute(
+            """
+            UPDATE customers
+            SET name=:n, address=:a, contact=:c, terms=:t
+            WHERE id=:id
+            """,
+            n=new_name,
+            a=new_address,
+            c=new_contact,
+            t=int(new_terms),
+            id=customer_id
+        )
+        st.success("Kunde wurde aktualisiert.")
+        st.cache_data.clear()
+        st.rerun()
+
     # -------- Kundendetails: Schulden & gelieferte Ware --------
     if not dfc_view.empty:
         st.markdown("### Kundendetails")
