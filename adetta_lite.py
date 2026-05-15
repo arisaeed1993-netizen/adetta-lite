@@ -44,8 +44,19 @@ def make_ddl(dialect: str):
         )
         """,
         f"""
+        CREATE TABLE IF NOT EXISTS delivery_headers (
+            id {id_col},
+            ddate DATE NOT NULL,
+            customer_id INTEGER NOT NULL,
+            note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_delivery_header_cust FOREIGN KEY(customer_id) REFERENCES customers(id)
+        )
+        """,
+        f"""
         CREATE TABLE IF NOT EXISTS deliveries (
             id {id_col},
+            header_id INTEGER,
             ddate DATE NOT NULL,
             customer_id INTEGER NOT NULL,
             product_id INTEGER NOT NULL,
@@ -98,14 +109,19 @@ with ENGINE.begin() as conn:
     for ddl in make_ddl(DIALECT):
         conn.execute(text(ddl))
 
-    # Migration für ältere Datenbanken: mehrere Lieferzeilen können nun zu einer Rechnung gehören.
+    # Migration für ältere Datenbanken:
+    # - invoice_id verbindet mehrere Produktpositionen mit einer Rechnung.
+    # - header_id verbindet mehrere Produktpositionen mit einer einzigen sichtbaren Liefer-ID.
     try:
         if DIALECT.startswith("postgresql"):
             conn.execute(text("ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS invoice_id INTEGER"))
+            conn.execute(text("ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS header_id INTEGER"))
         else:
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(deliveries)")).fetchall()]
             if "invoice_id" not in cols:
                 conn.execute(text("ALTER TABLE deliveries ADD COLUMN invoice_id INTEGER"))
+            if "header_id" not in cols:
+                conn.execute(text("ALTER TABLE deliveries ADD COLUMN header_id INTEGER"))
     except Exception:
         pass
 
@@ -117,6 +133,32 @@ with ENGINE.begin() as conn:
         )
         WHERE invoice_id IS NULL
     """))
+
+    # Für vorhandene Lieferpositionen ohne Header wird je Rechnung ein Lieferkopf erzeugt.
+    # Wenn keine Rechnung existiert, bekommt jede einzelne Position einen eigenen Lieferkopf.
+    orphan_rows = conn.execute(text("""
+        SELECT d.id, d.ddate, d.customer_id, d.note, d.invoice_id
+        FROM deliveries d
+        WHERE d.header_id IS NULL
+        ORDER BY COALESCE(d.invoice_id, d.id), d.id
+    """)).mappings().fetchall()
+    created_headers = {}
+    for row in orphan_rows:
+        group_key = row["invoice_id"] if row["invoice_id"] is not None else f"delivery-{row['id']}"
+        if group_key not in created_headers:
+            conn.execute(text("""
+                INSERT INTO delivery_headers(ddate, customer_id, note)
+                VALUES (:d, :c, :n)
+            """), {"d": row["ddate"], "c": row["customer_id"], "n": row["note"]})
+            if DIALECT.startswith("postgresql"):
+                header_id = conn.execute(text("SELECT currval(pg_get_serial_sequence('delivery_headers','id'))")).scalar()
+            else:
+                header_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+            created_headers[group_key] = int(header_id)
+        conn.execute(text("UPDATE deliveries SET header_id=:h WHERE id=:id"), {
+            "h": created_headers[group_key],
+            "id": row["id"],
+        })
 
 
 # ------------------ Helper ------------------
@@ -140,6 +182,12 @@ def execute(sql, **params):
 def execute_scalar(sql, **params):
     with ENGINE.begin() as conn:
         return conn.execute(text(sql), params).scalar()
+
+
+def get_last_insert_id(conn, table_name: str):
+    if DIALECT.startswith("postgresql"):
+        return int(conn.execute(text(f"SELECT currval(pg_get_serial_sequence('{table_name}','id'))")).scalar())
+    return int(conn.execute(text("SELECT last_insert_rowid()")).scalar())
 
 
 def get_invoice_status(inv_id: int):
@@ -470,7 +518,7 @@ def render_deliveries():
                     error = True
 
                 if not error:
-                    # Eine Buchung = mehrere Lieferzeilen, aber nur eine gemeinsame Rechnung.
+                    # Eine Buchung = ein Lieferkopf + mehrere Produktpositionen + eine Rechnung.
                     due = ddate + timedelta(days=cust_terms)
                     invoice_total = sum(
                         Decimal(str(line["unit_price"])) * Decimal(str(line["qty"]))
@@ -478,128 +526,155 @@ def render_deliveries():
                     )
 
                     with ENGINE.begin() as conn:
-                        delivery_ids = []
+                        conn.execute(text(
+                            "INSERT INTO delivery_headers(ddate,customer_id,note) VALUES (:d,:c,:n)"
+                        ), {"d": ddate.isoformat(), "c": int(cust_id), "n": note})
+                        header_id = get_last_insert_id(conn, "delivery_headers")
+
+                        delivery_line_ids = []
                         for line in lines:
                             conn.execute(text(
-                                "INSERT INTO deliveries(ddate,customer_id,product_id,qty,unit_price,note) "
-                                "VALUES (:d,:c,:p,:q,:u,:n)"
+                                "INSERT INTO deliveries(header_id,ddate,customer_id,product_id,qty,unit_price,note) "
+                                "VALUES (:h,:d,:c,:p,:q,:u,:n)"
                             ), {
-                                "d": ddate.isoformat(), "c": int(cust_id), "p": line["prod_id"],
-                                "q": line["qty"], "u": line["unit_price"], "n": note
+                                "h": header_id,
+                                "d": ddate.isoformat(),
+                                "c": int(cust_id),
+                                "p": line["prod_id"],
+                                "q": line["qty"],
+                                "u": line["unit_price"],
+                                "n": note,
                             })
-
-                            if DIALECT.startswith("postgresql"):
-                                delivery_id = conn.execute(text("SELECT currval(pg_get_serial_sequence('deliveries','id'))")).scalar()
-                            else:
-                                delivery_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
-
-                            delivery_ids.append(int(delivery_id))
+                            delivery_line_id = get_last_insert_id(conn, "deliveries")
+                            delivery_line_ids.append(int(delivery_line_id))
                             conn.execute(text("UPDATE products SET stock = stock - :q WHERE id=:pid"), {
                                 "q": line["qty"], "pid": line["prod_id"]
                             })
 
-                        first_delivery_id = delivery_ids[0]
+                        # Für Kompatibilität bleibt invoices.delivery_id auf der ersten Produktposition.
+                        first_delivery_line_id = delivery_line_ids[0]
                         conn.execute(text(
                             "INSERT INTO invoices(delivery_id,total,issued_at,due_at,status) "
                             "VALUES (:delivery_id, :t, :i, :du, 'open')"
                         ), {
-                            "delivery_id": first_delivery_id,
+                            "delivery_id": first_delivery_line_id,
                             "t": float(invoice_total),
                             "i": ddate.isoformat(),
                             "du": due.isoformat()
                         })
-
-                        if DIALECT.startswith("postgresql"):
-                            invoice_id = conn.execute(text("SELECT currval(pg_get_serial_sequence('invoices','id'))")).scalar()
-                        else:
-                            invoice_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+                        invoice_id = get_last_insert_id(conn, "invoices")
 
                         conn.execute(
                             text("UPDATE deliveries SET invoice_id=:inv WHERE id IN :ids")
                             .bindparams(bindparam("ids", expanding=True)),
-                            {"inv": int(invoice_id), "ids": delivery_ids}
+                            {"inv": int(invoice_id), "ids": delivery_line_ids}
                         )
 
-                    st.success(f"Lieferung mit {len(lines)} Produktposition(en) und 1 Rechnung erstellt. Gesamt: {money(invoice_total)}")
+                    st.success(
+                        f"Lieferung #{header_id} mit {len(lines)} Produktposition(en) und 1 Rechnung erstellt. "
+                        f"Gesamt: {money(invoice_total)}"
+                    )
                     st.cache_data.clear()
                     st.rerun()
 
     st.divider()
     st.subheader("Letzte Lieferungen")
-    df_last = load_df("""
-        SELECT d.id, d.ddate, c.name AS kunde, p.name AS produkt, d.qty, d.unit_price,
-               (d.qty*d.unit_price) AS total,
-               i.id AS invoice_id, i.status
-        FROM deliveries d
-        JOIN customers c ON c.id = d.customer_id
-        JOIN products p ON p.id = d.product_id
-        JOIN invoices i ON i.id = COALESCE(d.invoice_id, i.id) AND (d.invoice_id = i.id OR i.delivery_id = d.id)
-        ORDER BY d.id DESC LIMIT 50
+    product_summary = (
+        "STRING_AGG(p.name || ' x ' || d.qty::TEXT, ', ' ORDER BY d.id)"
+        if DIALECT.startswith("postgresql")
+        else "GROUP_CONCAT(p.name || ' x ' || d.qty, ', ')"
+    )
+    df_last = load_df(f"""
+        SELECT h.id AS lieferung_id,
+               h.ddate,
+               c.name AS kunde,
+               {product_summary} AS produkte,
+               SUM(d.qty) AS kartons,
+               SUM(d.qty * d.unit_price) AS total,
+               MIN(i.id) AS invoice_id,
+               MIN(i.status) AS status
+        FROM delivery_headers h
+        JOIN customers c ON c.id = h.customer_id
+        JOIN deliveries d ON d.header_id = h.id
+        LEFT JOIN invoices i ON i.id = d.invoice_id
+        GROUP BY h.id, h.ddate, c.name
+        ORDER BY h.id DESC
+        LIMIT 50
     """)
-    st.dataframe(df_last, use_container_width=True)
+    st.dataframe(df_last, use_container_width=True, hide_index=True)
 
     st.subheader("Lieferung löschen")
     if df_last.empty:
         st.caption("Keine Lieferungen vorhanden.")
     else:
-        del_id = st.selectbox("Lieferung auswählen (ID)", df_last["id"].astype(int).tolist(), key="delete_delivery_id")
+        header_id = st.selectbox(
+            "Lieferung auswählen",
+            df_last["lieferung_id"].astype(int).tolist(),
+            format_func=lambda hid: (
+                f"Lieferung #{hid} - "
+                f"{df_last[df_last['lieferung_id'].astype(int) == int(hid)]['kunde'].iloc[0]} - "
+                f"{df_last[df_last['lieferung_id'].astype(int) == int(hid)]['produkte'].iloc[0]}"
+            ),
+            key="delete_delivery_header_id"
+        )
         if st.button("Ausgewählte Lieferung löschen", type="secondary", key="delete_delivery_btn"):
-            drow = load_df("SELECT * FROM deliveries WHERE id=:i", i=int(del_id))
-            if drow.empty:
+            lines_df = load_df("SELECT * FROM deliveries WHERE header_id=:h", h=int(header_id))
+            if lines_df.empty:
                 st.error("Lieferung nicht gefunden.")
             else:
-                prod_id = int(drow["product_id"].iloc[0])
-                qty = int(drow["qty"].iloc[0])
-                execute("UPDATE products SET stock = stock + :q WHERE id=:pid", q=qty, pid=prod_id)
-                inv = load_df("SELECT COALESCE(invoice_id, (SELECT id FROM invoices WHERE delivery_id=deliveries.id LIMIT 1)) AS id FROM deliveries WHERE id=:d", d=int(del_id))
-                inv_id = int(inv["id"].iloc[0]) if not inv.empty and inv["id"].iloc[0] is not None else None
-                execute("DELETE FROM deliveries WHERE id=:i", i=int(del_id))
+                inv_ids = [int(x) for x in lines_df["invoice_id"].dropna().unique().tolist()]
+                line_ids = [int(x) for x in lines_df["id"].astype(int).tolist()]
+                with ENGINE.begin() as conn:
+                    for _, row in lines_df.iterrows():
+                        conn.execute(
+                            text("UPDATE products SET stock = stock + :q WHERE id=:pid"),
+                            {"q": int(row["qty"]), "pid": int(row["product_id"])}
+                        )
+                    for inv_id in inv_ids:
+                        conn.execute(text("DELETE FROM payments WHERE invoice_id=:i"), {"i": inv_id})
+                        conn.execute(text("DELETE FROM invoices WHERE id=:i"), {"i": inv_id})
+                    conn.execute(
+                        text("DELETE FROM deliveries WHERE id IN :ids").bindparams(bindparam("ids", expanding=True)),
+                        {"ids": line_ids}
+                    )
+                    conn.execute(text("DELETE FROM delivery_headers WHERE id=:h"), {"h": int(header_id)})
 
-                if inv_id:
-                    remaining = int(execute_scalar("SELECT COUNT(*) FROM deliveries WHERE invoice_id=:i", i=inv_id) or 0)
-                    if remaining == 0:
-                        execute("DELETE FROM payments WHERE invoice_id=:i", i=inv_id)
-                        execute("DELETE FROM invoices WHERE id=:i", i=inv_id)
-                    else:
-                        new_total = execute_scalar("SELECT COALESCE(SUM(qty * unit_price), 0) FROM deliveries WHERE invoice_id=:i", i=inv_id) or 0
-                        execute("UPDATE invoices SET total=:t WHERE id=:i", t=float(new_total), i=inv_id)
-                        first_line = execute_scalar("SELECT MIN(id) FROM deliveries WHERE invoice_id=:i", i=inv_id)
-                        execute("UPDATE invoices SET delivery_id=:d WHERE id=:i", d=int(first_line), i=inv_id)
-                        update_invoice_status(inv_id)
-                st.success(f"Lieferung {del_id} wurde gelöscht, Bestand und Rechnung wurden korrigiert.")
+                st.success(f"Lieferung #{header_id} wurde vollständig gelöscht, inklusive Rechnung/Zahlungen und Lagerkorrektur.")
                 st.cache_data.clear()
                 st.rerun()
 
     st.divider()
-    st.subheader("Lieferung korrigieren")
+    st.subheader("Produktposition einer Lieferung korrigieren")
     df_edit_del = load_df("""
-        SELECT d.id, d.qty, d.unit_price, d.product_id, d.customer_id,
+        SELECT h.id AS lieferung_id, d.id AS position_id, d.qty, d.unit_price,
+               d.product_id, d.customer_id, d.invoice_id,
                p.name AS produkt, c.name AS kunde
         FROM deliveries d
+        JOIN delivery_headers h ON h.id = d.header_id
         JOIN products p ON p.id = d.product_id
         JOIN customers c ON c.id = d.customer_id
-        ORDER BY d.id DESC
+        ORDER BY h.id DESC, d.id ASC
     """)
 
     if df_edit_del.empty:
         st.caption("Keine Lieferungen zum Korrigieren vorhanden.")
     else:
-        del_choices = df_edit_del["id"].astype(int).tolist()
-        selected_id = st.selectbox(
-            "Lieferung auswählen",
-            del_choices,
-            format_func=lambda did: (
-                f"#{did} - "
-                f"{df_edit_del[df_edit_del['id'].astype(int) == int(did)]['kunde'].iloc[0]} - "
-                f"{df_edit_del[df_edit_del['id'].astype(int) == int(did)]['produkt'].iloc[0]} - "
-                f"{int(df_edit_del[df_edit_del['id'].astype(int) == int(did)]['qty'].iloc[0])} Kartons"
+        pos_choices = df_edit_del["position_id"].astype(int).tolist()
+        selected_pos_id = st.selectbox(
+            "Lieferung / Produktposition auswählen",
+            pos_choices,
+            format_func=lambda pid: (
+                f"Lieferung #{int(df_edit_del[df_edit_del['position_id'].astype(int) == int(pid)]['lieferung_id'].iloc[0])} - "
+                f"{df_edit_del[df_edit_del['position_id'].astype(int) == int(pid)]['kunde'].iloc[0]} - "
+                f"{df_edit_del[df_edit_del['position_id'].astype(int) == int(pid)]['produkt'].iloc[0]} - "
+                f"{int(df_edit_del[df_edit_del['position_id'].astype(int) == int(pid)]['qty'].iloc[0])} Kartons"
             ),
-            key="edit_delivery_select"
+            key="edit_delivery_position_select"
         )
-        drow = df_edit_del[df_edit_del["id"].astype(int) == int(selected_id)].iloc[0]
-        with st.form("edit_delivery_form"):
+        drow = df_edit_del[df_edit_del["position_id"].astype(int) == int(selected_pos_id)].iloc[0]
+        with st.form("edit_delivery_position_form"):
             new_qty = st.number_input("Neue Anzahl Kartons", min_value=1, step=1, value=int(drow["qty"]), key="edit_delivery_qty")
-            save_del = st.form_submit_button("Lieferung korrigieren")
+            save_del = st.form_submit_button("Produktposition korrigieren")
 
         if save_del:
             old_qty = int(drow["qty"])
@@ -609,19 +684,16 @@ def render_deliveries():
             if diff > current_stock:
                 st.error("Nicht genug Lagerbestand für diese Korrektur.")
             else:
-                execute("UPDATE deliveries SET qty=:q WHERE id=:id", q=int(new_qty), id=int(selected_id))
+                execute("UPDATE deliveries SET qty=:q WHERE id=:id", q=int(new_qty), id=int(selected_pos_id))
                 execute("UPDATE products SET stock = stock - :diff WHERE id=:pid", diff=diff, pid=product_id)
-                inv_id = execute_scalar("SELECT invoice_id FROM deliveries WHERE id=:id", id=int(selected_id))
-                if not inv_id:
-                    inv_id = execute_scalar("SELECT id FROM invoices WHERE delivery_id=:did", did=int(selected_id))
+                inv_id = int(drow["invoice_id"]) if pd.notna(drow["invoice_id"]) else None
                 if inv_id:
                     new_total = execute_scalar("SELECT COALESCE(SUM(qty * unit_price), 0) FROM deliveries WHERE invoice_id=:i", i=int(inv_id)) or 0
                     execute("UPDATE invoices SET total=:t WHERE id=:i", t=float(new_total), i=int(inv_id))
                     update_invoice_status(int(inv_id))
-                st.success("Lieferung wurde korrigiert.")
+                st.success(f"Lieferung #{int(drow['lieferung_id'])} wurde korrigiert.")
                 st.cache_data.clear()
                 st.rerun()
-
 
 def render_invoices_payments():
     st.subheader("Rechnungen")
@@ -859,7 +931,7 @@ def main():
     elif page == "💸 Ausgaben":
         render_expenses()
 
-    st.caption("Adetta Lite v0.5 — Eine Rechnung pro Mehrprodukt-Lieferung, schnellere Navigation ohne st.tabs.")
+    st.caption("Adetta Lite v0.7 — Eine sichtbare Liefer-ID pro Lieferung, mehrere Produktpositionen darunter, eine Rechnung pro Lieferung.")
 
 
 if __name__ == "__main__":
