@@ -182,6 +182,32 @@ with TABS[0]:
     period = st.selectbox("Zeitraum", ["30 Tage", "90 Tage", "365 Tage", "Alle"], index=0, key="period_dashboard")
     since = None if period == "Alle" else (date.today() - timedelta(days=int(period.split()[0]))).isoformat()
 
+    st.divider()
+st.subheader("Zahlungsübersicht")
+
+df_totals = load_df("""
+SELECT
+    COALESCE(SUM(i.total), 0) AS rechnungen_gesamt,
+    COALESCE(SUM(pay.sum_paid), 0) AS bezahlt_gesamt,
+    COALESCE(SUM(i.total), 0) - COALESCE(SUM(pay.sum_paid), 0) AS offen_gesamt
+FROM invoices i
+LEFT JOIN (
+    SELECT invoice_id, SUM(amount) AS sum_paid
+    FROM payments
+    GROUP BY invoice_id
+) pay ON pay.invoice_id = i.id
+""")
+
+if not df_totals.empty:
+    total_invoices = float(df_totals["rechnungen_gesamt"].iloc[0] or 0)
+    total_paid = float(df_totals["bezahlt_gesamt"].iloc[0] or 0)
+    total_open = float(df_totals["offen_gesamt"].iloc[0] or 0)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Rechnungen gesamt", f"{total_invoices:,.2f}")
+    c2.metric("Bezahlt gesamt", f"{total_paid:,.2f}")
+    c3.metric("Offen gesamt", f"{total_open:,.2f}")
+
     # Gesamtumsatz
     if since:
         rev_total = load_df("SELECT COALESCE(SUM(total),0) AS s FROM invoices WHERE issued_at >= :d", d=since).iloc[0]["s"] or 0
