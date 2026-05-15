@@ -596,6 +596,7 @@ def render_deliveries():
         FROM delivery_headers h
         JOIN customers c ON c.id = h.customer_id
         JOIN deliveries d ON d.header_id = h.id
+        JOIN products p ON p.id = d.product_id
         LEFT JOIN invoices i ON i.id = d.invoice_id
         GROUP BY h.id, h.ddate, c.name
         ORDER BY h.id DESC
@@ -710,7 +711,7 @@ def render_invoices_payments():
                COALESCE(pay.sum_paid, 0) AS bezahlt,
                i.total - COALESCE(pay.sum_paid, 0) AS offen
         FROM invoices i
-        JOIN deliveries d ON COALESCE(d.invoice_id, i.id) = i.id
+        JOIN deliveries d ON (d.invoice_id = i.id OR (d.invoice_id IS NULL AND d.id = i.delivery_id))
         JOIN customers c ON c.id = d.customer_id
         JOIN products p ON p.id = d.product_id
         LEFT JOIN (
@@ -931,7 +932,7 @@ def main():
     elif page == "💸 Ausgaben":
         render_expenses()
 
-    st.caption("Adetta Lite v0.7 — Eine sichtbare Liefer-ID pro Lieferung, mehrere Produktpositionen darunter, eine Rechnung pro Lieferung.")
+    st.caption("Adetta Lite v0.8 — Eine sichtbare Liefer-ID pro Lieferung, mehrere Produktpositionen darunter, eine Rechnung pro Lieferung.")
 
 
 if __name__ == "__main__":
