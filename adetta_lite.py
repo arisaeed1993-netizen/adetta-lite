@@ -340,115 +340,131 @@ with TABS[2]:
 # ------------- Lieferungen -------------
 with TABS[3]:
     st.subheader("Lieferung buchen")
-    dfc = load_df("SELECT id,name FROM customers ORDER BY name")
-    dfp = load_df("SELECT id,name,stock,price FROM products ORDER BY name")
+dfc = load_df("SELECT id,name FROM customers ORDER BY name")
+dfp = load_df("SELECT id,name,stock,price FROM products ORDER BY name")
 
-    if dfc.empty or dfp.empty:
-        st.info("Bitte zuerst Kunden und Produkte anlegen.")
-    else:
-        with st.form("deliv_form_multi", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            cust = c1.selectbox("Kunde", dfc["name"].tolist(), key="deliv_customer")
-            ddate = c2.date_input("Datum", value=date.today())
-            note = st.text_input("Notiz", value="")
+if dfc.empty or dfp.empty:
+    st.info("Bitte zuerst Kunden und Produkte anlegen.")
+else:
+    c1, c2 = st.columns(2)
+    cust = c1.selectbox("Kunde", dfc["name"].tolist(), key="deliv_customer")
+    ddate = c2.date_input("Datum", value=date.today(), key="deliv_date")
+    note = st.text_input("Notiz", value="", key="deliv_note")
 
-            st.markdown("**Produkte für diese Lieferung auswählen**")
-            prod_names = dfp["name"].tolist()
-            selected = st.multiselect(
-                "Produkte",
-                prod_names,
-                key="deliv_products"
+    st.markdown("**Produkte für diese Lieferung auswählen**")
+    selected = st.multiselect(
+        "Produkte",
+        dfp["name"].tolist(),
+        key="deliv_products"
+    )
+
+    quantities = {}
+
+    if selected:
+        st.markdown("**Mengen je Produkt (Kartons)**")
+
+        for pname in selected:
+            row = dfp[dfp["name"] == pname].iloc[0]
+            prod_id = int(row["id"])
+            stock_now = int(row["stock"])
+            price_now = float(row["price"] or 0)
+
+            col1, col2, col3 = st.columns([2, 1, 1])
+            col1.write(f"**{pname}**")
+            col2.write(f"Lager: {stock_now}")
+            col3.write(f"Preis/Karton: {price_now:,.2f}")
+
+            quantities[pname] = st.number_input(
+                f"Kartons für {pname}",
+                min_value=0,
+                step=1,
+                key=f"qty_{prod_id}"
             )
 
-            quantities = {}
-            if selected:
-                st.markdown("**Mengen je Produkt (Kartons)**")
-                for pname in selected:
-                    row = dfp[dfp["name"] == pname].iloc[0]
-                    max_stock = int(row["stock"])
-                    # max_stock nur Info – wir begrenzen unten logisch
-                    quantities[pname] = st.number_input(
-                        f"Kartons für {pname} (Lager: {max_stock})",
-                        min_value=0,
-                        step=1,
-                        key=f"qty_{int(row['id'])}"
+    submit = st.button("Lieferung buchen", type="primary")
+
+    if submit:
+        if not selected:
+            st.error("Bitte mindestens ein Produkt auswählen.")
+        else:
+            cust_id = int(dfc[dfc["name"] == cust].iloc[0]["id"])
+            cust_terms = int(load_df(
+                "SELECT terms FROM customers WHERE id=:i",
+                i=cust_id
+            ).iloc[0]["terms"])
+
+            lines = []
+            error = False
+
+            for pname in selected:
+                qty = int(quantities.get(pname, 0) or 0)
+
+                if qty <= 0:
+                    continue
+
+                row = dfp[dfp["name"] == pname].iloc[0]
+                prod_id = int(row["id"])
+                stock_now = int(row["stock"])
+                unit_price = float(row["price"] or 0)
+
+                if unit_price <= 0:
+                    st.error(f"Kein Preis für Produkt '{pname}' hinterlegt.")
+                    error = True
+                    break
+
+                if qty > stock_now:
+                    st.error(
+                        f"Nicht genug Bestand für '{pname}'. "
+                        f"Verfügbar: {stock_now}, angefragt: {qty}."
+                    )
+                    error = True
+                    break
+
+                lines.append({
+                    "prod_id": prod_id,
+                    "pname": pname,
+                    "qty": qty,
+                    "unit_price": unit_price
+                })
+
+            if not lines and not error:
+                st.error("Es wurden keine Mengen größer als 0 eingetragen.")
+                error = True
+
+            if not error:
+                for line in lines:
+                    execute(
+                        "INSERT INTO deliveries(ddate,customer_id,product_id,qty,unit_price,note) "
+                        "VALUES (:d,:c,:p,:q,:u,:n)",
+                        d=ddate.isoformat(),
+                        c=cust_id,
+                        p=line["prod_id"],
+                        q=int(line["qty"]),
+                        u=float(line["unit_price"]),
+                        n=note
                     )
 
-            submit = st.form_submit_button("Lieferung(en) buchen")
+                    execute(
+                        "UPDATE products SET stock = stock - :q WHERE id=:pid",
+                        q=int(line["qty"]),
+                        pid=line["prod_id"]
+                    )
 
-        if submit:
-            if not selected:
-                st.error("Bitte mindestens ein Produkt auswählen.")
-            else:
-                cust_id = int(dfc[dfc["name"] == cust].iloc[0]["id"])
-                cust_terms = int(load_df("SELECT terms FROM customers WHERE id=:i", i=cust_id).iloc[0]["terms"])
+                    total = Decimal(str(line["unit_price"])) * Decimal(str(line["qty"]))
+                    due = ddate + timedelta(days=cust_terms)
 
-                # 1. Alle Zeilen prüfen (Bestand, Mengen)
-                lines = []
-                error = False
-                for pname in selected:
-                    qty = int(quantities.get(pname, 0) or 0)
-                    if qty <= 0:
-                        continue
-                    row = dfp[dfp["name"] == pname].iloc[0]
-                    prod_id = int(row["id"])
-                    stock_now = int(row["stock"])
-                    unit_price = float(row["price"] or 0)
+                    execute(
+                        "INSERT INTO invoices(delivery_id,total,issued_at,due_at,status) "
+                        "VALUES ((SELECT MAX(id) FROM deliveries), :t, :i, :du, 'open')",
+                        t=float(total),
+                        i=ddate.isoformat(),
+                        du=due.isoformat()
+                    )
 
-                    if unit_price <= 0:
-                        st.error(f"Kein Preis für Produkt '{pname}' hinterlegt. Bitte im Produkte-Tab ergänzen.")
-                        error = True
-                        break
-                    if qty > stock_now:
-                        st.error(f"Nicht genug Bestand für '{pname}'. Verfügbar: {stock_now}, angefragt: {qty}.")
-                        error = True
-                        break
-
-                    lines.append({
-                        "prod_id": prod_id,
-                        "pname": pname,
-                        "qty": qty,
-                        "unit_price": unit_price
-                    })
-
-                if not lines and not error:
-                    st.error("Es wurden keine Mengen > 0 eingetragen.")
-                    error = True
-
-                # 2. Wenn alles ok → Schreiben
-                if not error:
-                    for line in lines:
-                        prod_id = line["prod_id"]
-                        pname = line["pname"]
-                        qty = line["qty"]
-                        unit_price = line["unit_price"]
-
-                        # Lieferung speichern
-                        execute(
-                            "INSERT INTO deliveries(ddate,customer_id,product_id,qty,unit_price,note) "
-                            "VALUES (:d,:c,:p,:q,:u,:n)",
-                            d=ddate.isoformat(), c=cust_id, p=prod_id, q=int(qty),
-                            u=unit_price, n=note
-                        )
-                        # Bestand reduzieren
-                        execute(
-                            "UPDATE products SET stock = stock - :q WHERE id=:pid",
-                            q=int(qty), pid=prod_id
-                        )
-                        # Rechnung erzeugen (eine pro Produkt-Lieferung)
-                        total = Decimal(str(unit_price)) * Decimal(str(qty))
-                        issued = ddate
-                        due = ddate + timedelta(days=cust_terms)
-                        execute(
-                            "INSERT INTO invoices(delivery_id,total,issued_at,due_at,status) "
-                            "VALUES ((SELECT MAX(id) FROM deliveries), :t, :i, :du, 'open')",
-                            t=float(total), i=issued.isoformat(), du=due.isoformat()
-                        )
-
-                    refresh_invoice_statuses()
-                    st.success(f"{len(lines)} Lieferung(en) & Rechnungen erstellt.")
-                    st.cache_data.clear()
-                    st.rerun()
+                refresh_invoice_statuses()
+                st.success(f"{len(lines)} Lieferung(en) & Rechnungen erstellt.")
+                st.cache_data.clear()
+                st.rerun()
 
     st.subheader("Letzte Lieferungen")
     q_last = """
