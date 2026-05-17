@@ -13,6 +13,13 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import bindparam, create_engine, text
 
+try:
+    import folium
+    from streamlit_folium import st_folium
+except Exception:
+    folium = None
+    st_folium = None
+
 # ------------------ DB ------------------
 DB_URL = os.environ.get("ADETTA_DB", "sqlite:///adetta_lite.db")
 ENGINE = create_engine(DB_URL, future=True)
@@ -39,6 +46,10 @@ def make_ddl(dialect: str):
             name TEXT NOT NULL,
             address TEXT,
             contact TEXT,
+            latitude NUMERIC,
+            longitude NUMERIC,
+            map_address TEXT,
+            area_name TEXT,
             terms INTEGER DEFAULT 30,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -118,7 +129,20 @@ with ENGINE.begin() as conn:
             conn.execute(text("ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS invoice_id INTEGER"))
             conn.execute(text("ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS header_id INTEGER"))
             conn.execute(text("ALTER TABLE invoices ADD COLUMN IF NOT EXISTS invoice_no INTEGER"))
+            conn.execute(text("ALTER TABLE customers ADD COLUMN IF NOT EXISTS latitude NUMERIC"))
+            conn.execute(text("ALTER TABLE customers ADD COLUMN IF NOT EXISTS longitude NUMERIC"))
+            conn.execute(text("ALTER TABLE customers ADD COLUMN IF NOT EXISTS map_address TEXT"))
+            conn.execute(text("ALTER TABLE customers ADD COLUMN IF NOT EXISTS area_name TEXT"))
         else:
+            cust_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(customers)")).fetchall()]
+            if "latitude" not in cust_cols:
+                conn.execute(text("ALTER TABLE customers ADD COLUMN latitude NUMERIC"))
+            if "longitude" not in cust_cols:
+                conn.execute(text("ALTER TABLE customers ADD COLUMN longitude NUMERIC"))
+            if "map_address" not in cust_cols:
+                conn.execute(text("ALTER TABLE customers ADD COLUMN map_address TEXT"))
+            if "area_name" not in cust_cols:
+                conn.execute(text("ALTER TABLE customers ADD COLUMN area_name TEXT"))
             cols = [row[1] for row in conn.execute(text("PRAGMA table_info(deliveries)")).fetchall()]
             if "invoice_id" not in cols:
                 conn.execute(text("ALTER TABLE deliveries ADD COLUMN invoice_id INTEGER"))
@@ -247,6 +271,26 @@ def money(value):
     return f"{float(value or 0):,.2f}"
 
 
+def parse_google_maps_input(value: str):
+    """Einfache Hilfe: akzeptiert '35.55, 45.43' oder Google-Maps-Links mit @lat,lng."""
+    if not value:
+        return None, None
+    txt = value.strip()
+    import re
+
+    match = re.search(r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", txt)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+
+    match = re.search(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", txt)
+    if match:
+        lat = float(match.group(1))
+        lon = float(match.group(2))
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    return None, None
+
+
 # ------------------ Seiten ------------------
 def render_dashboard():
     st.subheader("Lagerbestand")
@@ -349,6 +393,11 @@ def render_customers():
         caddr = c1.text_input("Adresse", key="cust_addr_add")
         ccontact = c1.text_input("Kontakt", key="cust_contact_add")
         cterms = c2.number_input("Zahlungsziel (Tage)", min_value=0, step=1, value=30, key="cust_terms_add")
+        c2.markdown("**Karte (optional)**")
+        cmap_address = c2.text_input("Adresse für Karte", key="cust_map_addr_add")
+        carea_name = c2.text_input("Stadtteil / Gebiet", key="cust_area_add")
+        clat = c2.number_input("Latitude", value=0.0, format="%.6f", key="cust_lat_add")
+        clon = c2.number_input("Longitude", value=0.0, format="%.6f", key="cust_lon_add")
         ok = st.form_submit_button("Hinzufügen")
 
     if ok:
@@ -356,15 +405,21 @@ def render_customers():
             st.error("Bitte Kundennamen eingeben.")
         else:
             execute(
-                "INSERT INTO customers(name,address,contact,terms) VALUES (:n,:a,:c,:t)",
-                n=cname, a=caddr, c=ccontact, t=int(cterms)
+                """
+                INSERT INTO customers(name,address,contact,terms,latitude,longitude,map_address,area_name)
+                VALUES (:n,:a,:c,:t,:lat,:lon,:ma,:area)
+                """,
+                n=cname, a=caddr, c=ccontact, t=int(cterms),
+                lat=float(clat) if float(clat) != 0.0 else None,
+                lon=float(clon) if float(clon) != 0.0 else None,
+                ma=cmap_address, area=carea_name
             )
             st.success("Kunde angelegt")
             st.cache_data.clear()
             st.rerun()
 
     st.subheader("Kunden")
-    dfc_view = load_df("SELECT id,name,address,contact,terms,created_at FROM customers ORDER BY name")
+    dfc_view = load_df("SELECT id,name,address,contact,latitude,longitude,map_address,area_name,terms,created_at FROM customers ORDER BY name")
     st.dataframe(dfc_view, use_container_width=True)
 
     if dfc_view.empty:
@@ -386,16 +441,29 @@ def render_customers():
         new_address = st.text_input("Adresse", value=row["address"] or "", key="edit_customer_address")
         new_contact = st.text_input("Kontakt", value=row["contact"] or "", key="edit_customer_contact")
         new_terms = st.number_input("Zahlungsziel Tage", min_value=0, step=1, value=int(row["terms"] or 0), key="edit_customer_terms")
+        st.markdown("**Karte / Standort**")
+        map_input = st.text_input("Google-Maps-Link oder Koordinaten einfügen", value="", key="edit_customer_map_input")
+        parsed_lat, parsed_lon = parse_google_maps_input(map_input)
+        base_lat = float(row["latitude"]) if pd.notna(row.get("latitude")) else 0.0
+        base_lon = float(row["longitude"]) if pd.notna(row.get("longitude")) else 0.0
+        new_lat = st.number_input("Latitude", value=float(parsed_lat) if parsed_lat is not None else base_lat, format="%.6f", key="edit_customer_lat")
+        new_lon = st.number_input("Longitude", value=float(parsed_lon) if parsed_lon is not None else base_lon, format="%.6f", key="edit_customer_lon")
+        new_map_address = st.text_input("Adresse für Karte", value=row["map_address"] or row["address"] or "", key="edit_customer_map_address")
+        new_area = st.text_input("Stadtteil / Gebiet", value=row["area_name"] or "", key="edit_customer_area")
         save_customer = st.form_submit_button("Kunden speichern")
 
     if save_customer:
         execute(
             """
             UPDATE customers
-            SET name=:n, address=:a, contact=:c, terms=:t
+            SET name=:n, address=:a, contact=:c, terms=:t,
+                latitude=:lat, longitude=:lon, map_address=:ma, area_name=:area
             WHERE id=:id
             """,
-            n=new_name, a=new_address, c=new_contact, t=int(new_terms), id=int(edit_customer_id)
+            n=new_name, a=new_address, c=new_contact, t=int(new_terms),
+            lat=float(new_lat) if float(new_lat) != 0.0 else None,
+            lon=float(new_lon) if float(new_lon) != 0.0 else None,
+            ma=new_map_address, area=new_area, id=int(edit_customer_id)
         )
         st.success("Kunde wurde aktualisiert.")
         st.cache_data.clear()
@@ -859,6 +927,134 @@ def render_invoices_payments():
             st.rerun()
 
 
+def render_map():
+    st.subheader("Karte / Gebietsabdeckung")
+
+    if folium is None or st_folium is None:
+        st.error("Für die Kartenansicht fehlen Pakete: folium und streamlit-folium.")
+        st.code("pip install folium streamlit-folium", language="bash")
+        st.info("Auf Streamlit Cloud bitte auch requirements.txt entsprechend erweitern.")
+        return
+
+    df = load_df("""
+        SELECT c.id, c.name, c.address, c.map_address, c.area_name,
+               c.latitude, c.longitude,
+               COALESCE(SUM(i.total), 0) AS umsatz,
+               COALESCE(SUM(pay.sum_paid), 0) AS bezahlt,
+               COALESCE(SUM(i.total), 0) - COALESCE(SUM(pay.sum_paid), 0) AS offen,
+               MAX(h.ddate) AS letzte_lieferung
+        FROM customers c
+        LEFT JOIN delivery_headers h ON h.customer_id = c.id
+        LEFT JOIN deliveries d ON d.header_id = h.id
+        LEFT JOIN invoices i ON i.id = d.invoice_id
+        LEFT JOIN (
+            SELECT invoice_id, SUM(amount) AS sum_paid
+            FROM payments
+            GROUP BY invoice_id
+        ) pay ON pay.invoice_id = i.id
+        GROUP BY c.id, c.name, c.address, c.map_address, c.area_name, c.latitude, c.longitude
+        ORDER BY c.name
+    """)
+
+    if df.empty:
+        st.info("Noch keine Kunden/Supermärkte angelegt.")
+        return
+
+    df_geo = df[pd.notna(df["latitude"]) & pd.notna(df["longitude"])].copy()
+    missing_geo = df[pd.isna(df["latitude"]) | pd.isna(df["longitude"])].copy()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Supermärkte gesamt", len(df))
+    c2.metric("Auf Karte lokalisiert", len(df_geo))
+    c3.metric("Ohne Koordinaten", len(missing_geo))
+
+    st.markdown("### Koordinaten schnell eintragen")
+    selected_customer_id = st.selectbox(
+        "Supermarkt auswählen",
+        df["id"].astype(int).tolist(),
+        format_func=lambda cid: df[df["id"].astype(int) == int(cid)]["name"].iloc[0],
+        key="map_customer_select"
+    )
+    selected = df[df["id"].astype(int) == int(selected_customer_id)].iloc[0]
+
+    with st.form("map_location_form"):
+        st.caption("Du kannst aus Google Maps entweder Koordinaten wie 35.56, 45.43 oder einen Link mit @35.56,45.43 einfügen.")
+        map_text = st.text_input("Google-Maps-Link oder Koordinaten", key="map_parse_input")
+        parsed_lat, parsed_lon = parse_google_maps_input(map_text)
+        current_lat = float(selected["latitude"]) if pd.notna(selected["latitude"]) else 0.0
+        current_lon = float(selected["longitude"]) if pd.notna(selected["longitude"]) else 0.0
+        lat = st.number_input("Latitude", value=float(parsed_lat) if parsed_lat is not None else current_lat, format="%.6f", key="map_lat")
+        lon = st.number_input("Longitude", value=float(parsed_lon) if parsed_lon is not None else current_lon, format="%.6f", key="map_lon")
+        area = st.text_input("Stadtteil / Gebiet", value=selected["area_name"] or "", key="map_area")
+        map_address = st.text_input("Adresse für Karte", value=selected["map_address"] or selected["address"] or "", key="map_address")
+        save_loc = st.form_submit_button("Standort speichern")
+
+    if save_loc:
+        execute(
+            """
+            UPDATE customers
+            SET latitude=:lat, longitude=:lon, map_address=:ma, area_name=:area
+            WHERE id=:id
+            """,
+            lat=float(lat) if float(lat) != 0.0 else None,
+            lon=float(lon) if float(lon) != 0.0 else None,
+            ma=map_address,
+            area=area,
+            id=int(selected_customer_id),
+        )
+        st.success("Standort gespeichert.")
+        st.cache_data.clear()
+        st.rerun()
+
+    st.divider()
+    st.markdown("### Kartenansicht")
+    if df_geo.empty:
+        st.warning("Noch kein Supermarkt hat Koordinaten. Trage zuerst Latitude/Longitude ein.")
+    else:
+        center_lat = float(df_geo["latitude"].mean())
+        center_lon = float(df_geo["longitude"].mean())
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=12, control_scale=True)
+
+        show_radius = st.checkbox("500-m-Abdeckungsradius anzeigen", value=True, key="show_radius")
+        for _, row in df_geo.iterrows():
+            lat = float(row["latitude"])
+            lon = float(row["longitude"])
+            offen = float(row["offen"] or 0)
+            umsatz = float(row["umsatz"] or 0)
+            letzte = row["letzte_lieferung"] or "-"
+            popup_html = f"""
+            <b>{row['name']}</b><br>
+            Gebiet: {row['area_name'] or '-'}<br>
+            Adresse: {row['map_address'] or row['address'] or '-'}<br>
+            Umsatz: {umsatz:,.2f}<br>
+            Offen: {offen:,.2f}<br>
+            Letzte Lieferung: {letzte}
+            """
+            folium.Marker(
+                location=[lat, lon],
+                popup=folium.Popup(popup_html, max_width=300),
+                tooltip=row["name"],
+            ).add_to(m)
+            if show_radius:
+                folium.Circle(
+                    location=[lat, lon],
+                    radius=500,
+                    fill=True,
+                    fill_opacity=0.08,
+                    weight=1,
+                ).add_to(m)
+
+        st_folium(m, width=None, height=650)
+
+    if not missing_geo.empty:
+        st.markdown("### Supermärkte ohne Koordinaten")
+        st.dataframe(
+            missing_geo[["id", "name", "address", "map_address", "area_name"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
 def render_expenses():
     st.subheader("Ausgaben erfassen")
     cat_options = ["Lohn", "Lagerung", "Transport", "Werbung", "Standkosten"]
@@ -947,6 +1143,7 @@ def main():
             "🧑‍🤝‍🧑 Kunden",
             "🚚 Lieferungen",
             "🧾 Rechnungen & Zahlungen",
+            "🗺️ Karte",
             "💸 Ausgaben",
         ],
         key="main_page"
@@ -962,10 +1159,12 @@ def main():
         render_deliveries()
     elif page == "🧾 Rechnungen & Zahlungen":
         render_invoices_payments()
+    elif page == "🗺️ Karte":
+        render_map()
     elif page == "💸 Ausgaben":
         render_expenses()
 
-    st.caption("Adetta Lite v0.9 — Liefer-ID und sichtbare Rechnungsnummer sind jetzt identisch; technische IDs bleiben intern getrennt.")
+    st.caption("Adetta Lite v1.0 — Kartenmodul mit Supermarkt-Standorten und 500-m-Abdeckungsradius.")
 
 
 if __name__ == "__main__":
