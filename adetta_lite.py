@@ -1030,11 +1030,7 @@ def render_map():
             Offen: {offen:,.2f}<br>
             Letzte Lieferung: {letzte}
             """
-            folium.Marker(
-                location=[lat, lon],
-                popup=folium.Popup(popup_html, max_width=300),
-                tooltip=row["name"],
-            ).add_to(m)
+           
             if show_radius:
                 folium.Circle(
                     location=[lat, lon],
